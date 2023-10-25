@@ -7,7 +7,7 @@ pub type RedisResult<T> = std::result::Result<T, RedisError>;
 pub enum RedisError {
     IoError(io::ErrorKind),
     ErrorResponse(String),
-    ErrIllegalTypeConversion,
+    ErrIllegalTypeConversion(String),
     NoBytesWriten,
     ConnectionError,
     UnexpectedResponseType,

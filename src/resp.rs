@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::cmd::Cmd;
+use crate::cmd::{Arg, Cmd};
 use crate::frame::Response;
 use crate::types::{self, RedisError, RedisResult};
 
@@ -35,9 +35,18 @@ impl Value {
             ':' => Some(Self::Int(f.read_next()?.parse().ok()?)),
             '$' => {
                 let count = f.read_next()?.parse::<usize>().ok()?;
-                Some(Self::Data(f.read(count)?.as_bytes().to_vec()))
+                let res = Some(Self::Data(f.read(count)?.as_bytes().to_vec()));
+                f.read(2); // read the next \r\n
+                res
             }
-            '*' => todo!("Some(Self::Boolean)"),
+            '*' => {
+                let count = f.read_next()?.parse::<usize>().ok()?;
+                let mut res: Vec<Self> = vec![];
+                for i in 0..count {
+                    res.push(Self::from_frame(f)?);
+                }
+                Some(Self::Bulk(res))
+            }
             '_' => todo!("Some(Self::Null)"),
             '#' => todo!("Some(Self::Boolean)"),
             ',' => todo!("Some(Self::Double)"),
@@ -51,16 +60,44 @@ impl Value {
         }
     }
 }
+impl TryFrom<Value> for () {
+    type Error = RedisError;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Ok(())
+    }
+}
+impl TryFrom<Value> for usize {
+    type Error = RedisError;
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Int(d) => Ok(d.try_into().unwrap()),
+            _ => Err(RedisError::ErrIllegalTypeConversion(format!("{:?}", value))),
+        }
+    }
+}
 
-// impl From<Value> for i64 {
-//     fn from(v: Value) -> Self {
-//         dbg!(v.clone());
-//         match v {
-//             Value::Int(d) => d,
-//             _ => -619,
-//         }
-//     }
-// }
+impl TryFrom<Value> for Vec<String> {
+    type Error = RedisError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        match value {
+            Value::Bulk(v) => {
+                let mut res = vec![];
+                for elem in v {
+                    match elem.try_into() {
+                        Ok(o) => {
+                            res.push(o);
+                        }
+                        Err(r) => return Err(r),
+                    };
+                }
+                Ok(res)
+            }
+            _ => Err(RedisError::ErrIllegalTypeConversion(format!("{:?}", value))),
+        }
+    }
+}
+
 impl TryFrom<Value> for i64 {
     type Error = RedisError;
 
@@ -68,7 +105,7 @@ impl TryFrom<Value> for i64 {
         match value {
             Value::Int(d) => Ok(d),
             Value::Status(s) => Err(RedisError::ErrorResponse(s)),
-            _ => Err(RedisError::ErrIllegalTypeConversion),
+            _ => Err(RedisError::ErrIllegalTypeConversion(format!("{:?}", value))),
         }
     }
 }
@@ -108,12 +145,10 @@ impl Connection {
         self.recv.reset();
         match self.conn.read(&mut self.recv.b)? {
             0 => Err(RedisError::NoBytesWriten),
-            // _ => Ok(Value::from_frame(&mut self.recv).unwrap().try_into()?),
             _ => {
                 let value = Value::from_frame(&mut self.recv).unwrap();
                 let out: RedisResult<T> = value.try_into();
                 out
-                // Ok(())
             }
         }
     }
@@ -122,10 +157,10 @@ impl Connection {
         T: TryFrom<Value, Error = RedisError>,
     {
         let x = &cmd.bytes()[..];
-        print!("will send {}", String::from_utf8(x.to_vec()).unwrap());
+        let length = x.len();
         match self.conn.write(x)? {
-            0 => Err(RedisError::NoBytesWriten),
-            _ => Ok(()),
+            n if n == length => Ok(()),
+            _ => Err(RedisError::NoBytesWriten),
         }?;
         self.get_reply()
     }
@@ -136,10 +171,6 @@ impl Connection {
             _ => Ok(()),
         }
     }
-    fn resp(&mut self, s: String) -> RedisResult<Value> {
-        self.send(s)?;
-        self.get_reply()
-    }
 }
 
 impl Client {
@@ -149,40 +180,40 @@ impl Client {
         })
     }
     fn set(&mut self, key: &str, value: &str) -> types::RedisResult<()> {
-        match self.conn.resp(format!("SET {} {}\r\n", key, value))? {
-            Value::Okay => Ok(()),
-            _ => Err(RedisError::UnexpectedResponseType),
-        }
+        self.conn.exec(Cmd::new().arg("SET").arg(key))
     }
     fn del(&mut self, key: &str) -> RedisResult<usize> {
-        match self.conn.resp(format!("DEL {}\r\n", key))? {
-            Value::Int(d) => Ok(d as usize),
-            _ => Err(RedisError::UnexpectedResponseType),
-        }
+        self.conn.exec(Cmd::new().arg("DEL").arg(key))
     }
     fn get(&mut self, key: &str) -> types::RedisResult<String> {
-        match self.conn.resp(format!("GET {}\r\n", key))? {
-            Value::Data(v) => Ok(Value::Data(v).try_into()?),
-            _ => Err(RedisError::UnexpectedResponseType),
-        }
+        self.conn.exec(Cmd::new().arg("GET").arg(key))
     }
     fn decr(&mut self, key: &str) -> types::RedisResult<i64> {
-        match self.conn.resp(format!("DECR {}\r\n", key))? {
-            Value::Int(d) => Ok(d),
-            _ => Err(RedisError::UnexpectedResponseType),
-        }
+        self.conn.exec(Cmd::new().arg("DECR").arg(key))
     }
     fn incr(&mut self, key: &str) -> types::RedisResult<i64> {
-        match self.conn.resp(format!("INCR {}\r\n", key))? {
-            Value::Int(d) => Ok(d),
-            _ => Err(RedisError::UnexpectedResponseType),
-        }
+        self.conn.exec(Cmd::new().arg("INCR").arg(key))
     }
     fn incrby(&mut self, key: &str, n: usize) -> RedisResult<i64> {
         self.conn.exec(Cmd::new().arg("INCRBY").arg(key).arg(n))
     }
     fn decrby(&mut self, key: &str, n: usize) -> RedisResult<i64> {
         self.conn.exec(Cmd::new().arg("DECRBY").arg(key).arg(n))
+    }
+    fn lpush<T: Into<Arg>>(&mut self, key: &str, value: T) -> RedisResult<usize> {
+        self.conn.exec(Cmd::new().arg("LPUSH").arg(key).arg(value))
+    }
+    fn lpop(
+        &mut self,
+        key: &str,
+        count: Option<std::num::NonZeroUsize>,
+    ) -> RedisResult<Vec<String>> {
+        // cast to something that can be passed as an arg
+        let u: usize = match count {
+            Some(d) => d.into(),
+            None => 1,
+        };
+        self.conn.exec(Cmd::new().arg("LPOP").arg(key).arg(u))
     }
 }
 
@@ -201,22 +232,39 @@ mod tests {
     #[test]
     fn get_number() -> RedisResult<()> {
         let mut client = Client::new()?;
-        client.del("abc").unwrap(); // cleanup
-        assert_eq!(-1, client.decr("abc")?);
-        assert_eq!(-2, client.decr("abc")?);
-        assert_eq!(-1, client.incr("abc")?);
-        assert_eq!(0, client.incr("abc")?);
-        assert_eq!(1, client.incr("abc")?);
+        client.del("number").unwrap(); // cleanup
+        assert_eq!(-1, client.decr("number")?);
+        assert_eq!(-2, client.decr("number")?);
+        assert_eq!(-1, client.incr("number")?);
+        assert_eq!(0, client.incr("number")?);
+        assert_eq!(1, client.incr("number")?);
         Ok(())
     }
 
     #[test]
     fn incrby() -> RedisResult<()> {
         let mut client = Client::new()?;
-        client.del("abc").unwrap();
-        assert_eq!(10, client.incrby("abc", 10)?);
-        assert_eq!(20, client.incrby("abc", 10)?);
-        assert_eq!(-10, client.decrby("abc", 30)?);
+        client.del("incrby").unwrap();
+        assert_eq!(10, client.incrby("incrby", 10)?);
+        assert_eq!(20, client.incrby("incrby", 10)?);
+        assert_eq!(-10, client.decrby("incrby", 30)?);
+        Ok(())
+    }
+
+    #[test]
+    fn lpush() -> RedisResult<()> {
+        let mut client = Client::new()?;
+        client.del("lpush").unwrap();
+        assert_eq!(1, client.lpush("lpush", "a")?);
+        assert_eq!(2, client.lpush("lpush", "b")?);
+        assert_eq!(3, client.lpush("lpush", "c")?);
+        assert_eq!(
+            vec!["c", "b", "a"],
+            client.lpop("lpush", Some(3.try_into().unwrap()))?
+        );
+        client.lpush("lpush", "a")?;
+        assert_eq!(vec!["a"], client.lpop("lpush", None)?);
+        client.lpush("lpush", "a")?;
         Ok(())
     }
 }

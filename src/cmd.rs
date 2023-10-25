@@ -31,9 +31,10 @@ impl Cmd {
         let mut acc = vec![];
         self.args.iter().for_each(|a| {
             acc.extend_from_slice(a.0.as_bytes());
-            acc.push(b'\r');
-            acc.push(b'\n');
+            acc.push(b' ');
         });
+        acc.push(b'\r');
+        acc.push(b'\n');
         acc
     }
 }
